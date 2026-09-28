@@ -1,4 +1,4 @@
-name: SlimBOX S912 - stock kernel reproduction
+name: SlimBOX S912 - historical stock ABI search
 
 on:
   workflow_dispatch:
@@ -9,9 +9,14 @@ on:
         default: "LineageOS/android_kernel_amlogic_linux-4.9-pie"
         type: string
       source_ref:
-        description: "Branch/tag/commit to test (candidate only; ABI report decides)"
+        description: "Branch whose history will be searched"
         required: true
         default: "lineage-19.1"
+        type: string
+      target_time:
+        description: "Use newest commit at/before this UTC time (empty = branch tip)"
+        required: false
+        default: "2020-07-08T12:59:03Z"
         type: string
       build_dtbs:
         description: "Also build DTBs"
@@ -40,23 +45,57 @@ jobs:
       - name: Checkout builder repository
         uses: actions/checkout@v7
 
-      - name: Check required stock config
+      - name: Check stock inputs
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f stock/kernel-config.gz ]]; then
-            echo "::error::Missing stock/kernel-config.gz"
-            echo "Copy the original /proc/config.gz backup into stock/kernel-config.gz and commit it."
-            exit 1
-          fi
 
-      - name: Checkout candidate Amlogic kernel
+          test -f stock/kernel-config.gz || {
+            echo "::error::Missing stock/kernel-config.gz"
+            exit 1
+          }
+
+          test -f stock/modversions/amvdec_h264.modversions.txt || {
+            echo "::error::Missing amvdec_h264 CRC fingerprint"
+            exit 1
+          }
+
+          test -f stock/modversions/decoder_common.modversions.txt || {
+            echo "::error::Missing decoder_common CRC fingerprint"
+            exit 1
+          }
+
+      - name: Checkout candidate Amlogic kernel with full history
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref }}
           path: kernel-src
-          fetch-depth: 1
+          fetch-depth: 0
+
+      - name: Select historical snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested="${{ inputs.target_time }}"
+
+          if [[ -n "$requested" ]]; then
+            commit="$(git -C kernel-src rev-list -1 --before="$requested" HEAD)"
+            if [[ -z "$commit" ]]; then
+              echo "::error::No commit exists at/before $requested in history of ${{ inputs.source_ref }}"
+              exit 1
+            fi
+
+            echo "Historical snapshot selected:"
+            git -C kernel-src show -s \
+              --format='commit=%H%ncommit_date=%cI%nauthor_date=%aI%nsubject=%s' \
+              "$commit"
+
+            git -C kernel-src checkout --detach "$commit"
+          else
+            echo "target_time is empty; using requested ref tip."
+          fi
 
       - name: Install host build dependencies
         shell: bash
@@ -106,7 +145,7 @@ jobs:
           done
 
           if [[ "$ok" != "1" ]]; then
-            echo "::error::Could not download a valid Linaro GCC 6.3.1-2017.02 archive from any configured mirror."
+            echo "::error::Could not download a valid Linaro GCC archive."
             exit 1
           fi
 
@@ -118,7 +157,7 @@ jobs:
           echo "TC_DIR=$TC_DIR" >> "$GITHUB_ENV"
           echo "CROSS_COMPILE=$TC_DIR/bin/arm-linux-gnueabihf-" >> "$GITHUB_ENV"
 
-      - name: Record source and compiler identity
+      - name: Record selected source and compiler identity
         shell: bash
         run: |
           set -euo pipefail
@@ -127,8 +166,11 @@ jobs:
           {
             echo "repository=${{ inputs.source_repo }}"
             echo "requested_ref=${{ inputs.source_ref }}"
+            echo "requested_target_time=${{ inputs.target_time }}"
             echo "commit=$(git -C kernel-src rev-parse HEAD)"
             echo "commit_date=$(git -C kernel-src show -s --format=%cI HEAD)"
+            echo "author_date=$(git -C kernel-src show -s --format=%aI HEAD)"
+            echo "subject=$(git -C kernel-src show -s --format=%s HEAD)"
             echo "describe=$(git -C kernel-src describe --always --dirty 2>/dev/null || true)"
           } | tee artifact/SOURCE_IDENTITY.txt
 
@@ -139,21 +181,15 @@ jobs:
             kernel-src/Makefile | tee artifact/SOURCE_KERNEL_VERSION.txt
 
           test "$(cat artifact/SOURCE_KERNEL_VERSION.txt)" = "4.9.113"
-
           git -C kernel-src diff --exit-code
 
-      - name: Prepare exact stock config and show candidate-forced changes
+      - name: Prepare stock config and record candidate-forced changes
         shell: bash
         run: |
           set -euo pipefail
 
           gzip -dc stock/kernel-config.gz > artifact/stock.config
           cp artifact/stock.config build/.config
-
-          {
-            echo "Important stock settings:"
-            grep -E '^(CONFIG_ARM|CONFIG_LOCALVERSION|CONFIG_IKCONFIG|CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_SMP|CONFIG_PREEMPT)=' artifact/stock.config || true
-          } | tee artifact/STOCK_CONFIG_KEY_LINES.txt
 
           make -C kernel-src \
             O="$GITHUB_WORKSPACE/build" \
@@ -170,9 +206,6 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             kernelrelease | tee artifact/KERNELRELEASE.txt
 
-          echo "Kernel release produced by candidate config:"
-          cat artifact/KERNELRELEASE.txt
-
       - name: Snapshot super_scaler source area
         shell: bash
         run: |
@@ -183,15 +216,13 @@ jobs:
             {
               echo "File: $VPP"
               echo
-              grep -n -B 10 -A 15 -E 'super_scaler' "$VPP" | head -n 160 || true
+              grep -n -B 10 -A 15 -E 'super_scaler' "$VPP" | head -n 180 || true
             } > artifact/VPP_SUPER_SCALER_SOURCE.txt
           else
             echo "Expected VPP file not found: $VPP" > artifact/VPP_SUPER_SCALER_SOURCE.txt
           fi
 
-          cat artifact/VPP_SUPER_SCALER_SOURCE.txt
-
-      - name: Build completely unmodified kernel
+      - name: Build completely unmodified historical kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -201,7 +232,6 @@ jobs:
             TARGETS+=(dtbs)
           fi
 
-          echo "Targets: ${TARGETS[*]}"
           make -C kernel-src \
             O="$GITHUB_WORKSPACE/build" \
             ARCH="$ARCH" \
@@ -219,15 +249,6 @@ jobs:
           cp build/System.map artifact/System.map
           cp build/vmlinux artifact/vmlinux
 
-          mkdir -p artifact/dtbs
-          if [[ -d build/arch/arm/boot/dts ]]; then
-            while IFS= read -r -d '' f; do
-              rel="${f#build/arch/arm/boot/dts/}"
-              mkdir -p "artifact/dtbs/$(dirname "$rel")"
-              cp "$f" "artifact/dtbs/$rel"
-            done < <(find build/arch/arm/boot/dts -type f -name '*.dtb' -print0)
-          fi
-
           {
             echo "zImage:"
             file artifact/zImage
@@ -241,46 +262,24 @@ jobs:
             file artifact/vmlinux
           } | tee artifact/BUILD_PRODUCTS.txt
 
-          git -C kernel-src status --short > artifact/SOURCE_STATUS_AFTER_BUILD.txt
-          git -C kernel-src diff > artifact/SOURCE_DIFF_AFTER_BUILD.patch
-
-      - name: Optional CRC check against vendor modules
+      - name: Compare against stock module CRC fingerprints
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/vendor-modversions
-
-          shopt -s nullglob
-          modules=(stock/*.ko)
-
-          if (( ${#modules[@]} == 0 )); then
-            {
-              echo "# ABI / MODVERSIONS report"
-              echo
-              echo "Vendor .ko files were not placed in the public repository."
-              echo
-              echo "Build succeeded and Module.symvers is available."
-              echo "Compare it later against the original amvdec_h264.ko and decoder_common.ko."
-            } > artifact/ABI_REPORT.md
-
-            cat artifact/ABI_REPORT.md >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          for mod in "${modules[@]}"; do
-            base="$(basename "$mod")"
-            echo "Reading MODVERSIONS from $base"
-            modprobe --dump-modversions "$mod" \
-              > "artifact/vendor-modversions/${base}.txt"
-          done
 
           python3 scripts/compare_modversions.py \
             artifact/Module.symvers \
-            artifact/vendor-modversions \
+            stock/modversions \
             artifact/ABI_REPORT.md
 
           cat artifact/ABI_REPORT.md
           cat artifact/ABI_REPORT.md >> "$GITHUB_STEP_SUMMARY"
+
+          if grep -q 'VERDICT=MATCH' artifact/ABI_REPORT.md; then
+            echo "::notice::All tested stock module CRCs match this source snapshot."
+          else
+            echo "::warning::This source snapshot is not a full CRC match. Do not flash it."
+          fi
 
       - name: Package checksums
         if: always()
@@ -296,11 +295,11 @@ jobs:
             ) > artifact/SHA256SUMS.txt
           fi
 
-      - name: Upload reproduction artifacts
+      - name: Upload historical ABI-search artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: SlimBOX-S912-stock-kernel-reproduction
+          name: SlimBOX-S912-historical-ABI-search
           path: artifact/
           if-no-files-found: warn
           retention-days: 14

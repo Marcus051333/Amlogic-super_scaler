@@ -1,4 +1,4 @@
-name: SlimBOX S912 - historical stock ABI search
+name: SlimBOX S912 - historical stock ABI search v1.3
 
 on:
   workflow_dispatch:
@@ -109,6 +109,28 @@ jobs:
             kmod xz-utils gzip file rsync cpio \
             python3 perl
 
+      - name: Configure legacy host GCC compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Old DTC sources rely on GCC's pre-10 common-symbol behavior.
+          # Keep the kernel source untouched and add -fcommon only to HOSTCC.
+          cat > "$GITHUB_WORKSPACE/hostcc-fcommon" <<'EOF'
+          #!/bin/sh
+          exec gcc -fcommon "$@"
+          EOF
+
+          chmod +x "$GITHUB_WORKSPACE/hostcc-fcommon"
+          echo "HOSTCC_COMPAT=$GITHUB_WORKSPACE/hostcc-fcommon" >> "$GITHUB_ENV"
+
+          {
+            echo "Host compiler compatibility wrapper:"
+            echo "  gcc -fcommon"
+            echo
+            gcc --version | head -n 1
+          } | tee hostcc-compat.txt
+
       - name: Download exact Linaro GCC 6.3.1-2017.02
         shell: bash
         run: |
@@ -195,6 +217,7 @@ jobs:
             O="$GITHUB_WORKSPACE/build" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC="$HOSTCC_COMPAT" \
             olddefconfig 2>&1 | tee artifact/olddefconfig.log
 
           cp build/.config artifact/effective.config
@@ -204,6 +227,7 @@ jobs:
             O="$GITHUB_WORKSPACE/build" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC="$HOSTCC_COMPAT" \
             kernelrelease | tee artifact/KERNELRELEASE.txt
 
       - name: Snapshot super_scaler source area
@@ -236,6 +260,7 @@ jobs:
             O="$GITHUB_WORKSPACE/build" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
+            HOSTCC="$HOSTCC_COMPAT" \
             -j"$(nproc)" \
             "${TARGETS[@]}" 2>&1 | tee artifact/build.log
 

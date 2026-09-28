@@ -1,0 +1,5 @@
+stock/*.ko
+build/
+toolchain/
+artifact/
+*.tar.xz

@@ -25,7 +25,6 @@ permissions:
 env:
   ARCH: arm
   TOOLCHAIN_ARCHIVE: gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf.tar.xz
-  TOOLCHAIN_URL: https://releases.linaro.org/components/toolchain/binaries/6.3-2017.02/arm-linux-gnueabihf/gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf.tar.xz
   TOOLCHAIN_SHA256: fe1cae02e0734665487b9b642171a5685a6e91416cea869bb22590f6dc7260c3
   KBUILD_BUILD_USER: daivietpda
   KBUILD_BUILD_HOST: gocmobile
@@ -78,14 +77,44 @@ jobs:
           mkdir -p toolchain
           cd toolchain
 
-          curl --fail --location --retry 5 --retry-delay 3 \
-            "$TOOLCHAIN_URL" -o "$TOOLCHAIN_ARCHIVE"
+          urls=(
+            "https://mirrors.dotsrc.org/armbian-dl/_toolchain/$TOOLCHAIN_ARCHIVE"
+            "https://mirror-us-stl1.armbian.airframes.io/dl/_toolchain/$TOOLCHAIN_ARCHIVE"
+            "https://releases.linaro.org/components/toolchain/binaries/6.3-2017.02/arm-linux-gnueabihf/$TOOLCHAIN_ARCHIVE"
+          )
 
-          echo "$TOOLCHAIN_SHA256  $TOOLCHAIN_ARCHIVE" | sha256sum -c -
+          ok=0
+          for url in "${urls[@]}"; do
+            echo "Trying: $url"
+            rm -f "$TOOLCHAIN_ARCHIVE"
+
+            if ! curl --fail --location --retry 3 --retry-delay 2 \
+              --connect-timeout 20 \
+              "$url" -o "$TOOLCHAIN_ARCHIVE"; then
+              echo "Download failed from this mirror."
+              continue
+            fi
+
+            echo "Downloaded size: $(stat -c%s "$TOOLCHAIN_ARCHIVE") bytes"
+
+            if echo "$TOOLCHAIN_SHA256  $TOOLCHAIN_ARCHIVE" | sha256sum -c -; then
+              ok=1
+              break
+            fi
+
+            echo "Checksum mismatch from this mirror; trying next one."
+          done
+
+          if [[ "$ok" != "1" ]]; then
+            echo "::error::Could not download a valid Linaro GCC 6.3.1-2017.02 archive from any configured mirror."
+            exit 1
+          fi
 
           tar -xJf "$TOOLCHAIN_ARCHIVE"
 
           TC_DIR="$GITHUB_WORKSPACE/toolchain/gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf"
+          test -x "$TC_DIR/bin/arm-linux-gnueabihf-gcc"
+
           echo "TC_DIR=$TC_DIR" >> "$GITHUB_ENV"
           echo "CROSS_COMPILE=$TC_DIR/bin/arm-linux-gnueabihf-" >> "$GITHUB_ENV"
 

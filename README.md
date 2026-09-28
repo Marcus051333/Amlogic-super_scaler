@@ -1,99 +1,48 @@
-# SlimBOX 9.2.0 / H96 Pro+ S912 — stock kernel reproduction builder
+# SlimBOX S912 v1.2 update
 
-This is **phase 1 only**.
+This update changes the workflow from a branch-tip build into a historical ABI search.
 
-It does **not** patch `super_scaler`.
-It does **not** repack `boot.img`.
-It does **not** flash anything.
+## What changes
 
-Goal: test whether the candidate public Amlogic Android Pie 4.9.113 source can
-reproduce the stock kernel closely enough, especially its `CONFIG_MODVERSIONS`
-symbol CRCs.
+- keeps `LineageOS/android_kernel_amlogic_linux-4.9-pie` as the candidate source family
+- fetches full history of `lineage-19.1`
+- by default selects the newest commit at or before:
+  `2020-07-08T12:59:03Z`
+- builds the kernel unmodified with the stock config and Linaro GCC 6.3.1-2017.02
+- automatically compares `Module.symvers` against CRC fingerprints extracted from:
+  - stock `amvdec_h264.ko` (95 imported symbols)
+  - stock `decoder_common.ko` (175 imported symbols)
+- does NOT include or publish the original `.ko` binaries
+- does NOT patch `super_scaler`
+- does NOT create or flash a boot image
 
-## Known stock target
+## Files to replace/add in the existing repository
 
-- H96 Pro+ / Amlogic S912 (GXM)
-- SlimBOX 9.2.0 X92-compatible ROM
-- ARMv7 / 32-bit ARM
-- Linux 4.9.113
-- `CONFIG_MODVERSIONS=y`
-- Linaro GCC 6.3.1-2017.02
-- original build identity `daivietpda@gocmobile`
-- original build timestamp `Wed Jul 8 19:59:03 +07 2020`
+Replace:
 
-## Required file
+    .github/workflows/stock-kernel-reproduction.yml
+    scripts/compare_modversions.py
 
-Copy:
+Add:
 
-    C:\SlimboxKernel\kernel-config.gz
+    stock/modversions/amvdec_h264.modversions.txt
+    stock/modversions/decoder_common.modversions.txt
 
-to:
+Keep your existing:
 
     stock/kernel-config.gz
 
-Do not rename or decompress it.
+## First v1.2 run
 
-## Public repo and vendor modules
+Use defaults:
 
-The workflow does not require original vendor `.ko` files to be committed publicly.
+    source_repo  = LineageOS/android_kernel_amlogic_linux-4.9-pie
+    source_ref   = lineage-19.1
+    target_time  = 2020-07-08T12:59:03Z
+    build_dtbs   = true
 
-After a successful build it uploads `Module.symvers`; that can be compared separately
-against your original:
+The workflow will select the newest commit in that branch history not newer than
+the stock kernel build time.
 
-    amvdec_h264.ko
-    decoder_common.ko
-
-If you explicitly want GitHub Actions to compare them automatically, you may add them
-to `stock/` with `git add -f`, but `.gitignore` blocks accidental publication by default.
-
-## Run
-
-1. Create a new public GitHub repository.
-2. Extract this ZIP into it.
-3. Add `stock/kernel-config.gz`.
-4. Commit and push.
-5. Open Actions.
-6. Select `SlimBOX S912 - stock kernel reproduction`.
-7. Click `Run workflow`.
-
-Default candidate:
-
-    LineageOS/android_kernel_amlogic_linux-4.9-pie
-    lineage-19.1
-
-The branch is only a candidate starting point. The workflow records the exact source
-commit. A clean compile alone is not proof of ABI compatibility.
-
-## Outputs
-
-The artifact includes, when the build reaches them:
-
-- zImage
-- vmlinux
-- System.map
-- Module.symvers
-- stock.config
-- effective.config
-- config.diff
-- KERNELRELEASE.txt
-- SOURCE_IDENTITY.txt
-- TOOLCHAIN.txt
-- VPP_SUPER_SCALER_SOURCE.txt
-- BUILD_PRODUCTS.txt
-- build.log
-- ABI_REPORT.md (if applicable)
-- SHA256SUMS.txt
-
-## First-run result to send back
-
-If successful, send:
-
-- `Module.symvers`
-- `config.diff`
-- `SOURCE_IDENTITY.txt`
-- `KERNELRELEASE.txt`
-- `VPP_SUPER_SCALER_SOURCE.txt`
-
-If it fails, send the failed Actions section or `build.log`.
-
-Do not flash `zImage` yet.
+After the run, inspect `ABI_REPORT.md`. A compile success is not enough; do not flash
+unless the tested stock CRC set is a complete match and later boot-image checks also pass.

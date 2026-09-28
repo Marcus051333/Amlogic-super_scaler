@@ -4,7 +4,9 @@ import sys
 from pathlib import Path
 
 if len(sys.argv) != 4:
-    raise SystemExit("usage: compare_modversions.py Module.symvers vendor_dir report.md")
+    raise SystemExit(
+        "usage: compare_modversions.py Module.symvers stock_modversions_dir report.md"
+    )
 
 symvers_path = Path(sys.argv[1])
 vendor_dir = Path(sys.argv[2])
@@ -54,34 +56,37 @@ for dump in sorted(vendor_dir.glob("*.txt")):
 lines = [
     "# ABI / CONFIG_MODVERSIONS comparison",
     "",
-    "This compares CRCs required by the original vendor modules with CRCs",
-    "exported by the candidate unmodified kernel build.",
+    "Stock fingerprints are symbol/CRC metadata extracted from the original",
+    "SlimBOX vendor modules. The original .ko binaries are not required in the repo.",
     "",
 ]
 
 if overall["parsed"] == 0:
-    lines += ["**Result: INCOMPLETE** — no vendor MODVERSIONS entries were parsed.", ""]
+    verdict = "INCOMPLETE"
+    lines += ["**Result: INCOMPLETE** — no stock MODVERSIONS entries were parsed.", ""]
 elif overall["mismatch"] == 0 and overall["missing"] == 0:
+    verdict = "MATCH"
     lines += [
-        "**Result: all tested vendor symbol CRCs match this candidate build.**",
+        "**Result: all tested stock symbol CRCs match this candidate build.**",
         "",
-        "This is strong evidence for the tested symbol set, but does not by itself",
-        "prove that the entire vendor kernel ABI is identical.",
+        "This is strong evidence for the tested symbol set, but it does not by itself",
+        "prove that the complete vendor kernel ABI is identical.",
         "",
     ]
 else:
+    verdict = "NO_MATCH"
     lines += [
-        "**Result: candidate is NOT ABI-compatible with the tested vendor symbol set.**",
+        "**Result: candidate is NOT ABI-compatible with the tested stock symbol set.**",
         "",
-        "Do not flash a kernel from this source/ref.",
+        "Do not flash a kernel from this source snapshot.",
         "",
     ]
 
 lines += [
-    f"- Parsed vendor requirements: {overall['parsed']}",
+    f"- Parsed stock requirements: {overall['parsed']}",
     f"- CRC matches: {overall['match']}",
     f"- CRC mismatches: {overall['mismatch']}",
-    f"- Missing candidate symbols: {overall['missing']}",
+    f"- Symbols missing from candidate Module.symvers: {overall['missing']}",
     "",
 ]
 
@@ -97,15 +102,35 @@ for name, entries, stats, mismatches, missing in results:
     ]
 
     if mismatches:
-        lines += ["### CRC mismatches", "", "| Symbol | Vendor | Candidate |", "|---|---:|---:|"]
-        for symbol, vendor, candidate in mismatches[:100]:
-            lines.append(f"| `{symbol}` | `0x{vendor:08x}` | `0x{candidate:08x}` |")
+        lines += ["### CRC mismatches", "", "| Symbol | Stock | Candidate |", "|---|---:|---:|"]
+        for symbol, stock, candidate in mismatches:
+            lines.append(f"| `{symbol}` | `0x{stock:08x}` | `0x{candidate:08x}` |")
         lines.append("")
 
     if missing:
-        lines += ["### Missing candidate symbols", "", "| Symbol | Vendor CRC |", "|---|---:|"]
-        for symbol, vendor in missing[:100]:
-            lines.append(f"| `{symbol}` | `0x{vendor:08x}` |")
+        lines += ["### Missing candidate symbols", "", "| Symbol | Stock CRC |", "|---|---:|"]
+        for symbol, stock in missing:
+            lines.append(f"| `{symbol}` | `0x{stock:08x}` |")
         lines.append("")
 
+lines += [
+    "## Machine-readable summary",
+    "",
+    f"`VERDICT={verdict}`",
+    f"`MATCH={overall['match']}`",
+    f"`MISMATCH={overall['mismatch']}`",
+    f"`MISSING={overall['missing']}`",
+    f"`PARSED={overall['parsed']}`",
+    "",
+]
+
 report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+# Also print concise result into the Actions log.
+print(
+    f"VERDICT={verdict} "
+    f"PARSED={overall['parsed']} "
+    f"MATCH={overall['match']} "
+    f"MISMATCH={overall['mismatch']} "
+    f"MISSING={overall['missing']}"
+)

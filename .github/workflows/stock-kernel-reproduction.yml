@@ -1,0 +1,277 @@
+name: SlimBOX S912 - stock kernel reproduction
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Candidate kernel repository"
+        required: true
+        default: "LineageOS/android_kernel_amlogic_linux-4.9-pie"
+        type: string
+      source_ref:
+        description: "Branch/tag/commit to test (candidate only; ABI report decides)"
+        required: true
+        default: "lineage-19.1"
+        type: string
+      build_dtbs:
+        description: "Also build DTBs"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm
+  TOOLCHAIN_ARCHIVE: gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf.tar.xz
+  TOOLCHAIN_URL: https://releases.linaro.org/components/toolchain/binaries/6.3-2017.02/arm-linux-gnueabihf/gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf.tar.xz
+  TOOLCHAIN_SHA256: fe1cae02e0734665487b9b642171a5685a6e91416cea869bb22590f6dc7260c3
+  KBUILD_BUILD_USER: daivietpda
+  KBUILD_BUILD_HOST: gocmobile
+  KBUILD_BUILD_VERSION: "1"
+  KBUILD_BUILD_TIMESTAMP: "Wed Jul 8 19:59:03 +07 2020"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v7
+
+      - name: Check required stock config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f stock/kernel-config.gz ]]; then
+            echo "::error::Missing stock/kernel-config.gz"
+            echo "Copy the original /proc/config.gz backup into stock/kernel-config.gz and commit it."
+            exit 1
+          fi
+
+      - name: Checkout candidate Amlogic kernel
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          path: kernel-src
+          fetch-depth: 1
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler u-boot-tools \
+            kmod xz-utils gzip file rsync cpio \
+            python3 perl
+
+      - name: Download exact Linaro GCC 6.3.1-2017.02
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p toolchain
+          cd toolchain
+
+          curl --fail --location --retry 5 --retry-delay 3 \
+            "$TOOLCHAIN_URL" -o "$TOOLCHAIN_ARCHIVE"
+
+          echo "$TOOLCHAIN_SHA256  $TOOLCHAIN_ARCHIVE" | sha256sum -c -
+
+          tar -xJf "$TOOLCHAIN_ARCHIVE"
+
+          TC_DIR="$GITHUB_WORKSPACE/toolchain/gcc-linaro-6.3.1-2017.02-x86_64_arm-linux-gnueabihf"
+          echo "TC_DIR=$TC_DIR" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=$TC_DIR/bin/arm-linux-gnueabihf-" >> "$GITHUB_ENV"
+
+      - name: Record source and compiler identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact build
+
+          {
+            echo "repository=${{ inputs.source_repo }}"
+            echo "requested_ref=${{ inputs.source_ref }}"
+            echo "commit=$(git -C kernel-src rev-parse HEAD)"
+            echo "commit_date=$(git -C kernel-src show -s --format=%cI HEAD)"
+            echo "describe=$(git -C kernel-src describe --always --dirty 2>/dev/null || true)"
+          } | tee artifact/SOURCE_IDENTITY.txt
+
+          "$TC_DIR/bin/arm-linux-gnueabihf-gcc" --version | tee artifact/TOOLCHAIN.txt
+          grep -q "6.3.1" artifact/TOOLCHAIN.txt
+
+          awk '/^VERSION =/{v=$3} /^PATCHLEVEL =/{p=$3} /^SUBLEVEL =/{s=$3} END{print v "." p "." s}' \
+            kernel-src/Makefile | tee artifact/SOURCE_KERNEL_VERSION.txt
+
+          test "$(cat artifact/SOURCE_KERNEL_VERSION.txt)" = "4.9.113"
+
+          git -C kernel-src diff --exit-code
+
+      - name: Prepare exact stock config and show candidate-forced changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gzip -dc stock/kernel-config.gz > artifact/stock.config
+          cp artifact/stock.config build/.config
+
+          {
+            echo "Important stock settings:"
+            grep -E '^(CONFIG_ARM|CONFIG_LOCALVERSION|CONFIG_IKCONFIG|CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_SMP|CONFIG_PREEMPT)=' artifact/stock.config || true
+          } | tee artifact/STOCK_CONFIG_KEY_LINES.txt
+
+          make -C kernel-src \
+            O="$GITHUB_WORKSPACE/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            olddefconfig 2>&1 | tee artifact/olddefconfig.log
+
+          cp build/.config artifact/effective.config
+          diff -u artifact/stock.config artifact/effective.config > artifact/config.diff || true
+
+          make -s -C kernel-src \
+            O="$GITHUB_WORKSPACE/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            kernelrelease | tee artifact/KERNELRELEASE.txt
+
+          echo "Kernel release produced by candidate config:"
+          cat artifact/KERNELRELEASE.txt
+
+      - name: Snapshot super_scaler source area
+        shell: bash
+        run: |
+          set -euo pipefail
+          VPP="kernel-src/drivers/amlogic/media/video_sink/vpp.c"
+
+          if [[ -f "$VPP" ]]; then
+            {
+              echo "File: $VPP"
+              echo
+              grep -n -B 10 -A 15 -E 'super_scaler' "$VPP" | head -n 160 || true
+            } > artifact/VPP_SUPER_SCALER_SOURCE.txt
+          else
+            echo "Expected VPP file not found: $VPP" > artifact/VPP_SUPER_SCALER_SOURCE.txt
+          fi
+
+          cat artifact/VPP_SUPER_SCALER_SOURCE.txt
+
+      - name: Build completely unmodified kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGETS=(zImage modules)
+          if [[ "${{ inputs.build_dtbs }}" == "true" ]]; then
+            TARGETS+=(dtbs)
+          fi
+
+          echo "Targets: ${TARGETS[*]}"
+          make -C kernel-src \
+            O="$GITHUB_WORKSPACE/build" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" \
+            "${TARGETS[@]}" 2>&1 | tee artifact/build.log
+
+      - name: Collect build products
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp build/arch/arm/boot/zImage artifact/zImage
+          cp build/Module.symvers artifact/Module.symvers
+          cp build/System.map artifact/System.map
+          cp build/vmlinux artifact/vmlinux
+
+          mkdir -p artifact/dtbs
+          if [[ -d build/arch/arm/boot/dts ]]; then
+            while IFS= read -r -d '' f; do
+              rel="${f#build/arch/arm/boot/dts/}"
+              mkdir -p "artifact/dtbs/$(dirname "$rel")"
+              cp "$f" "artifact/dtbs/$rel"
+            done < <(find build/arch/arm/boot/dts -type f -name '*.dtb' -print0)
+          fi
+
+          {
+            echo "zImage:"
+            file artifact/zImage
+            sha256sum artifact/zImage
+            echo
+            echo "Module.symvers:"
+            wc -l artifact/Module.symvers
+            sha256sum artifact/Module.symvers
+            echo
+            echo "vmlinux:"
+            file artifact/vmlinux
+          } | tee artifact/BUILD_PRODUCTS.txt
+
+          git -C kernel-src status --short > artifact/SOURCE_STATUS_AFTER_BUILD.txt
+          git -C kernel-src diff > artifact/SOURCE_DIFF_AFTER_BUILD.patch
+
+      - name: Optional CRC check against vendor modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/vendor-modversions
+
+          shopt -s nullglob
+          modules=(stock/*.ko)
+
+          if (( ${#modules[@]} == 0 )); then
+            {
+              echo "# ABI / MODVERSIONS report"
+              echo
+              echo "Vendor .ko files were not placed in the public repository."
+              echo
+              echo "Build succeeded and Module.symvers is available."
+              echo "Compare it later against the original amvdec_h264.ko and decoder_common.ko."
+            } > artifact/ABI_REPORT.md
+
+            cat artifact/ABI_REPORT.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for mod in "${modules[@]}"; do
+            base="$(basename "$mod")"
+            echo "Reading MODVERSIONS from $base"
+            modprobe --dump-modversions "$mod" \
+              > "artifact/vendor-modversions/${base}.txt"
+          done
+
+          python3 scripts/compare_modversions.py \
+            artifact/Module.symvers \
+            artifact/vendor-modversions \
+            artifact/ABI_REPORT.md
+
+          cat artifact/ABI_REPORT.md
+          cat artifact/ABI_REPORT.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d artifact ]]; then
+            (
+              cd artifact
+              find . -type f ! -name SHA256SUMS.txt -print0 \
+                | sort -z \
+                | xargs -0 sha256sum
+            ) > artifact/SHA256SUMS.txt
+          fi
+
+      - name: Upload reproduction artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SlimBOX-S912-stock-kernel-reproduction
+          path: artifact/
+          if-no-files-found: warn
+          retention-days: 14

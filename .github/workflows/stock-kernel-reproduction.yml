@@ -1,22 +1,17 @@
-name: SlimBOX S912 - historical stock ABI search v1.3
+name: SlimBOX S912 - final unmodified reproduction v1.4
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: "Candidate kernel repository"
+        description: "Pinned candidate kernel repository"
         required: true
         default: "LineageOS/android_kernel_amlogic_linux-4.9-pie"
         type: string
       source_ref:
-        description: "Branch whose history will be searched"
+        description: "Exact source commit/ref"
         required: true
-        default: "lineage-19.1"
-        type: string
-      target_time:
-        description: "Use newest commit at/before this UTC time (empty = branch tip)"
-        required: false
-        default: "2020-07-08T12:59:03Z"
+        default: "fba6cce6b08f7c5c005737e88d30aebcc26c2f5a"
         type: string
       build_dtbs:
         description: "Also build DTBs"
@@ -65,37 +60,49 @@ jobs:
             exit 1
           }
 
-      - name: Checkout candidate Amlogic kernel with full history
+          test -f stock/modversions/providers.tsv || {
+            echo "::error::Missing stock external-module provider CRC map"
+            exit 1
+          }
+
+      - name: Checkout exact candidate kernel snapshot
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref }}
           path: kernel-src
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Select historical snapshot
+      - name: Verify pinned snapshot and suppress Git suffix
         shell: bash
         run: |
           set -euo pipefail
 
-          requested="${{ inputs.target_time }}"
+          actual="$(git -C kernel-src rev-parse HEAD)"
+          echo "Checked out: $actual"
 
-          if [[ -n "$requested" ]]; then
-            commit="$(git -C kernel-src rev-list -1 --before="$requested" HEAD)"
-            if [[ -z "$commit" ]]; then
-              echo "::error::No commit exists at/before $requested in history of ${{ inputs.source_ref }}"
-              exit 1
-            fi
-
-            echo "Historical snapshot selected:"
-            git -C kernel-src show -s \
-              --format='commit=%H%ncommit_date=%cI%nauthor_date=%aI%nsubject=%s' \
-              "$commit"
-
-            git -C kernel-src checkout --detach "$commit"
-          else
-            echo "target_time is empty; using requested ref tip."
+          # Exact source snapshot selected from the successful historical search.
+          if [[ "${{ inputs.source_ref }}" =~ ^[0-9a-fA-F]{40}$ ]] && \
+             [[ "$actual" != "${{ inputs.source_ref }}" ]]; then
+            echo "::error::Checked-out commit is not the requested pinned SHA."
+            exit 1
           fi
+
+          # Keep CONFIG_LOCALVERSION_AUTO=y exactly as stock, but suppress the
+          # repository-derived -g<sha> suffix. Linux 4.9 setlocalversion treats
+          # an existing .scmversion as authoritative; an empty one means no SCM suffix.
+          grep -q '\.scmversion' kernel-src/scripts/setlocalversion
+          : > kernel-src/.scmversion
+
+          {
+            echo "repository=${{ inputs.source_repo }}"
+            echo "requested_ref=${{ inputs.source_ref }}"
+            echo "commit=$actual"
+            echo "commit_date=$(git -C kernel-src show -s --format=%cI HEAD)"
+            echo "author_date=$(git -C kernel-src show -s --format=%aI HEAD)"
+            echo "subject=$(git -C kernel-src show -s --format=%s HEAD)"
+            echo "scmversion_file=present_and_empty"
+          } | tee SOURCE_SELECTION.txt
 
       - name: Install host build dependencies
         shell: bash
@@ -107,15 +114,15 @@ jobs:
             libssl-dev libelf-dev libncurses-dev \
             device-tree-compiler u-boot-tools \
             kmod xz-utils gzip file rsync cpio \
-            python3 perl
+            python3 perl binutils
 
       - name: Configure legacy host GCC compatibility
         shell: bash
         run: |
           set -euo pipefail
 
-          # Old DTC sources rely on GCC's pre-10 common-symbol behavior.
-          # Keep the kernel source untouched and add -fcommon only to HOSTCC.
+          # Old DTC sources rely on pre-GCC-10 common-symbol behavior.
+          # This affects HOSTCC only, not the ARM target compiler or target ABI.
           cat > "$GITHUB_WORKSPACE/hostcc-fcommon" <<'EOF'
           #!/bin/sh
           exec gcc -fcommon "$@"
@@ -123,13 +130,6 @@ jobs:
 
           chmod +x "$GITHUB_WORKSPACE/hostcc-fcommon"
           echo "HOSTCC_COMPAT=$GITHUB_WORKSPACE/hostcc-fcommon" >> "$GITHUB_ENV"
-
-          {
-            echo "Host compiler compatibility wrapper:"
-            echo "  gcc -fcommon"
-            echo
-            gcc --version | head -n 1
-          } | tee hostcc-compat.txt
 
       - name: Download exact Linaro GCC 6.3.1-2017.02
         shell: bash
@@ -152,7 +152,6 @@ jobs:
             if ! curl --fail --location --retry 3 --retry-delay 2 \
               --connect-timeout 20 \
               "$url" -o "$TOOLCHAIN_ARCHIVE"; then
-              echo "Download failed from this mirror."
               continue
             fi
 
@@ -162,8 +161,6 @@ jobs:
               ok=1
               break
             fi
-
-            echo "Checksum mismatch from this mirror; trying next one."
           done
 
           if [[ "$ok" != "1" ]]; then
@@ -179,22 +176,13 @@ jobs:
           echo "TC_DIR=$TC_DIR" >> "$GITHUB_ENV"
           echo "CROSS_COMPILE=$TC_DIR/bin/arm-linux-gnueabihf-" >> "$GITHUB_ENV"
 
-      - name: Record selected source and compiler identity
+      - name: Record compiler and source identity
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifact build
 
-          {
-            echo "repository=${{ inputs.source_repo }}"
-            echo "requested_ref=${{ inputs.source_ref }}"
-            echo "requested_target_time=${{ inputs.target_time }}"
-            echo "commit=$(git -C kernel-src rev-parse HEAD)"
-            echo "commit_date=$(git -C kernel-src show -s --format=%cI HEAD)"
-            echo "author_date=$(git -C kernel-src show -s --format=%aI HEAD)"
-            echo "subject=$(git -C kernel-src show -s --format=%s HEAD)"
-            echo "describe=$(git -C kernel-src describe --always --dirty 2>/dev/null || true)"
-          } | tee artifact/SOURCE_IDENTITY.txt
+          cp SOURCE_SELECTION.txt artifact/SOURCE_IDENTITY.txt
 
           "$TC_DIR/bin/arm-linux-gnueabihf-gcc" --version | tee artifact/TOOLCHAIN.txt
           grep -q "6.3.1" artifact/TOOLCHAIN.txt
@@ -203,9 +191,11 @@ jobs:
             kernel-src/Makefile | tee artifact/SOURCE_KERNEL_VERSION.txt
 
           test "$(cat artifact/SOURCE_KERNEL_VERSION.txt)" = "4.9.113"
+
+          # .scmversion is intentionally untracked. Tracked source code must remain untouched.
           git -C kernel-src diff --exit-code
 
-      - name: Prepare stock config and record candidate-forced changes
+      - name: Prepare exact stock config and require zero config drift
         shell: bash
         run: |
           set -euo pipefail
@@ -223,6 +213,12 @@ jobs:
           cp build/.config artifact/effective.config
           diff -u artifact/stock.config artifact/effective.config > artifact/config.diff || true
 
+          if [[ -s artifact/config.diff ]]; then
+            echo "::error::Stock config changed after olddefconfig; refusing final reproduction build."
+            cat artifact/config.diff
+            exit 1
+          fi
+
           make -s -C kernel-src \
             O="$GITHUB_WORKSPACE/build" \
             ARCH="$ARCH" \
@@ -230,23 +226,26 @@ jobs:
             HOSTCC="$HOSTCC_COMPAT" \
             kernelrelease | tee artifact/KERNELRELEASE.txt
 
+          if [[ "$(cat artifact/KERNELRELEASE.txt)" != "4.9.113" ]]; then
+            echo "::error::Expected exact KERNELRELEASE=4.9.113"
+            exit 1
+          fi
+
+          echo "::notice::Exact stock-style KERNELRELEASE confirmed: 4.9.113"
+
       - name: Snapshot super_scaler source area
         shell: bash
         run: |
           set -euo pipefail
           VPP="kernel-src/drivers/amlogic/media/video_sink/vpp.c"
 
-          if [[ -f "$VPP" ]]; then
-            {
-              echo "File: $VPP"
-              echo
-              grep -n -B 10 -A 15 -E 'super_scaler' "$VPP" | head -n 180 || true
-            } > artifact/VPP_SUPER_SCALER_SOURCE.txt
-          else
-            echo "Expected VPP file not found: $VPP" > artifact/VPP_SUPER_SCALER_SOURCE.txt
-          fi
+          {
+            echo "File: $VPP"
+            echo
+            grep -n -B 10 -A 15 -E 'super_scaler' "$VPP" | head -n 180 || true
+          } > artifact/VPP_SUPER_SCALER_SOURCE.txt
 
-      - name: Build completely unmodified historical kernel
+      - name: Build final completely unmodified kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -274,6 +273,15 @@ jobs:
           cp build/System.map artifact/System.map
           cp build/vmlinux artifact/vmlinux
 
+          mkdir -p artifact/dtbs
+          if [[ -d build/arch/arm/boot/dts ]]; then
+            while IFS= read -r -d '' f; do
+              rel="${f#build/arch/arm/boot/dts/}"
+              mkdir -p "artifact/dtbs/$(dirname "$rel")"
+              cp "$f" "artifact/dtbs/$rel"
+            done < <(find build/arch/arm/boot/dts -type f -name '*.dtb' -print0)
+          fi
+
           {
             echo "zImage:"
             file artifact/zImage
@@ -285,9 +293,12 @@ jobs:
             echo
             echo "vmlinux:"
             file artifact/vmlinux
+            echo
+            echo "Kernel release:"
+            cat artifact/KERNELRELEASE.txt
           } | tee artifact/BUILD_PRODUCTS.txt
 
-      - name: Compare against stock module CRC fingerprints
+      - name: Verify tested stock ABI including external media providers
         shell: bash
         run: |
           set -euo pipefail
@@ -295,16 +306,18 @@ jobs:
           python3 scripts/compare_modversions.py \
             artifact/Module.symvers \
             stock/modversions \
+            stock/modversions/providers.tsv \
             artifact/ABI_REPORT.md
 
           cat artifact/ABI_REPORT.md
           cat artifact/ABI_REPORT.md >> "$GITHUB_STEP_SUMMARY"
 
-          if grep -q 'VERDICT=MATCH' artifact/ABI_REPORT.md; then
-            echo "::notice::All tested stock module CRCs match this source snapshot."
-          else
-            echo "::warning::This source snapshot is not a full CRC match. Do not flash it."
+          if ! grep -q 'VERDICT=MATCH' artifact/ABI_REPORT.md; then
+            echo "::error::Tested stock ABI fingerprint is not a complete match."
+            exit 1
           fi
+
+          echo "::notice::All 270 tested stock module imports resolved with matching CRCs."
 
       - name: Package checksums
         if: always()
@@ -320,11 +333,11 @@ jobs:
             ) > artifact/SHA256SUMS.txt
           fi
 
-      - name: Upload historical ABI-search artifacts
+      - name: Upload final unmodified reproduction artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: SlimBOX-S912-historical-ABI-search
+          name: SlimBOX-S912-final-unmodified-reproduction
           path: artifact/
           if-no-files-found: warn
           retention-days: 14
